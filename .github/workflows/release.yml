@@ -1,0 +1,86 @@
+name: release
+
+# release-please keeps a release PR open from the conventional commits on main.
+# Merging it tags the release; the build job then attaches the binaries.
+# Running it by hand with a tag rebuilds and replaces that release's binaries.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: existing release tag to rebuild binaries for
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      created: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        id: release
+
+  build:
+    needs: release-please
+    if: ${{ !cancelled() && (inputs.tag || needs.release-please.outputs.created == 'true') }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Arch names match `uname -m`, so the README install snippet can build the name.
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, name: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, name: linux-aarch64 }
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ inputs.tag || needs.release-please.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      NAME: clickflash-${{ matrix.name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+      - run: rustup toolchain install stable --profile minimal --target "$TARGET" && rustup default stable
+      - run: cargo build --locked --release --target "$TARGET"
+      - name: package and upload
+        run: |
+          # No version in the name, so releases/latest/download/<name> always works.
+          name="$NAME"
+          mkdir "$name"
+          cp README.md LICENSE "$name/"
+          cp "target/$TARGET/release/clickflash" "$name/"
+          tar czf "$name.tar.gz" "$name"
+          gh release upload --clobber "$TAG" "$name.tar.gz"
+
+  checksums:
+    needs: [release-please, build]
+    if: ${{ !cancelled() && (inputs.tag || needs.release-please.outputs.created == 'true') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ inputs.tag || needs.release-please.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: hash every binary on the release into one SHA256SUMS
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern 'clickflash-*.tar.gz' --dir dist
+          cd dist
+          sha256sum * >SHA256SUMS
+          cat SHA256SUMS
+          gh release upload --clobber "$TAG" SHA256SUMS --repo "$GITHUB_REPOSITORY"

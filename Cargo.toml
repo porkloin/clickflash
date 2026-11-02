@@ -1,0 +1,18 @@
+[package]
+name = "clickflash"
+version = "0.0.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "A click-to-photon latency workload: a black window that flashes one white frame per click"
+repository = "https://github.com/porkloin/clickflash"
+keywords = ["latency", "vulkan", "benchmark", "streaming"]
+categories = ["graphics", "development-tools::testing"]
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+libc = "0.2"
+winit = "0.30"
+
+[profile.release]
+strip = true
