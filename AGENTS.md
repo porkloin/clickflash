@@ -12,6 +12,9 @@ README.md is the short version for people.
 - It redraws continuously, so a capturing compositor always has new frames.
 - SIGTERM and SIGINT quit like Q (a streaming server stops its apps with SIGTERM), so the log is complete and the
   summary is printed.
+- `--flash-ms MS` keeps each flash white for at least MS as well as `--flash-frames` frames. With vsync a frame is
+  a display refresh, but `--no-vsync` draws thousands of frames a second, so a one-frame flash is too short for a
+  compositor or camera to catch: use something like `--no-vsync --flash-ms 34`.
 - `--no-vsync` presents with mailbox or immediate instead of FIFO.
 
 ## Log

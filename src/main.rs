@@ -23,6 +23,7 @@ pub struct Options {
 	pub size: (u32, u32),
 	pub vsync: bool,
 	pub flash_frames: u32,
+	pub flash_min: Duration,
 	pub log: Option<String>,
 }
 
@@ -30,6 +31,7 @@ const USAGE: &str = "\
 usage: clickflash [options]
 
   --flash-frames N        frames each flash lasts (default 1)
+  --flash-ms MS           ... and at least this long (default 0); without vsync frames are too short to be seen
   --log PATH              write every input and flash as a JSON line to PATH (- for stdout)
   --duration SECONDS      exit after SECONDS
   --fullscreen            borderless fullscreen
@@ -46,6 +48,7 @@ fn parse_args() -> Result<Options, String> {
 		size: (1920, 1080),
 		vsync: true,
 		flash_frames: 1,
+		flash_min: Duration::ZERO,
 		log: None,
 	};
 	let mut args = std::env::args().skip(1);
@@ -57,6 +60,13 @@ fn parse_args() -> Result<Options, String> {
 					.and_then(|v| v.parse().ok())
 					.filter(|n| *n >= 1)
 					.ok_or("--flash-frames needs a number of frames, at least 1")?;
+			},
+			"--flash-ms" => {
+				o.flash_min = Duration::from_millis(
+					args.next()
+						.and_then(|v| v.parse().ok())
+						.ok_or("--flash-ms needs a number of milliseconds")?,
+				);
 			},
 			"--log" => o.log = Some(args.next().ok_or("--log needs a path, or - for stdout")?),
 			"--duration" => {
@@ -114,8 +124,9 @@ struct App {
 	flashes: u64,
 	/// The input a flash is pending for: its number and when it arrived.
 	pending: Option<(u64, u64)>,
-	/// White frames still to present for the current flash.
+	/// White frames still to present for the current flash, and when its first white frame was drawn.
 	white_left: u32,
+	white_since: Option<Instant>,
 	/// Inputs that came while a flash was still pending or showing, and didn't get their own.
 	merged: u64,
 	/// Input-to-submit times, ms.
@@ -144,7 +155,7 @@ impl App {
 		self.inputs += 1;
 		let n = self.inputs;
 		self.log_line(format!(r#"{{"event":"input","input":{n},"kind":"{kind}","t_us":{t}}}"#));
-		if self.pending.is_some() || self.white_left > 0 {
+		if self.pending.is_some() || self.white_left > 0 || self.white_since.is_some() {
 			self.merged += 1;
 			return;
 		}
@@ -158,12 +169,17 @@ impl App {
 			return;
 		}
 		let Some(gpu) = &mut self.gpu else { return };
-		let white = self.white_left > 0;
+		// A flash lasts --flash-frames frames, and at least --flash-ms.
+		if self.white_left == 0 && self.white_since.is_some_and(|t| t.elapsed() >= self.options.flash_min) {
+			self.white_since = None;
+		}
+		let white = self.white_left > 0 || self.white_since.is_some();
 		match gpu.draw(white) {
 			Ok(None) => {},
 			Ok(Some(t)) => {
 				if white {
-					self.white_left -= 1;
+					self.white_left = self.white_left.saturating_sub(1);
+					self.white_since.get_or_insert_with(Instant::now);
 				}
 				// The first white frame of a flash is the one a sensor or a client sees.
 				if let Some((input, input_us)) = self.pending.take() {
@@ -305,6 +321,7 @@ fn main() -> ExitCode {
 		flashes: 0,
 		pending: None,
 		white_left: 0,
+		white_since: None,
 		merged: 0,
 		latencies: Vec::new(),
 		error: None,
