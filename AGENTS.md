@@ -19,15 +19,21 @@ README.md is the short version for people.
 
 ## Log
 
-`--log PATH` (`-` for stdout) writes one JSON object per line, flushed as it happens:
+`--log PATH` (`-` for stdout) appends one JSON object per line, flushed as it happens:
 
 ```text
-{"event":"input","input":1,"kind":"click","t_us":123456789}
-{"event":"flash","flash":1,"input":1,"t_us":123456870,"input_to_submit_us":81}
+{"event":"input","input":1,"kind":"click","click_id":1,"t_us":123456789,"unix_us":1793728374923981}
+{"event":"flash","flash":1,"input":1,"click_id":1,"t_us":123456870,"unix_us":1793728374924062,"input_to_submit_us":81}
 ```
 
+- `click_id` is the cell of a 64 × 32 grid over the window that the pointer was in when the click came (row × 64 +
+  column): gamestream-test-client moves the pointer to the middle of the cell numbered after each click before
+  pressing, so the log and the client's record name the same click. Absent for key presses and when the pointer
+  hasn't moved over the window.
+
 - `t_us` is microseconds on `CLOCK_MONOTONIC_RAW`, the clock moonlight-common-c uses, so other processes on the
-  machine can line their times up with these.
+  machine can line their times up with these. `unix_us` is the same time on the wall clock (microseconds since the
+  Unix epoch), for readers elsewhere: `moonshine-otel app` turns the log into OpenTelemetry metrics.
 - `input` is when the event loop received the input; winit gives no earlier timestamp.
 - A flash's `t_us` is when its first white frame was submitted to the GPU. It's the last point the app controls:
   with vsync, `queue_present` can block for up to a frame afterwards, so present-return time would overstate the

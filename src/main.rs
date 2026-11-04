@@ -3,7 +3,6 @@
 
 mod gpu;
 
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -114,16 +113,40 @@ pub fn now_us() -> u64 {
 	ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000
 }
 
+/// A `now_us` time on the wall clock, in microseconds since the Unix epoch, for readers on other machines.
+fn unix_us(t: u64) -> i64 {
+	let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+	// SAFETY: clock_gettime only writes the timespec it's given.
+	unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut ts) };
+	let wall = ts.tv_sec * 1_000_000 + ts.tv_nsec / 1000;
+	wall - now_us() as i64 + t as i64
+}
+
+/// The grid a click's id travels in: gamestream-test-client puts the pointer in the middle of cell `id` (row × COLS +
+/// column) of this grid over the stream before each click, so the id survives scaling and a lost input.
+const CLICK_COLS: f64 = 64.0;
+const CLICK_ROWS: f64 = 32.0;
+
+/// The click id under the pointer, from its position over a window of `size`.
+fn click_id(at: (f64, f64), size: (f64, f64)) -> Option<u64> {
+	if size.0 <= 0.0 || size.1 <= 0.0 || at.0 < 0.0 || at.1 < 0.0 || at.0 >= size.0 || at.1 >= size.1 {
+		return None;
+	}
+	Some((at.1 * CLICK_ROWS / size.1) as u64 * CLICK_COLS as u64 + (at.0 * CLICK_COLS / size.0) as u64)
+}
+
 struct App {
 	options: Options,
+	/// Where the pointer last was, in the window's pixels.
+	pointer: Option<(f64, f64)>,
 	gpu: Option<gpu::Gpu>,
 	start: Instant,
 	log: Option<Box<dyn Write>>,
 	/// Inputs received and flashes presented, numbered from 1.
 	inputs: u64,
 	flashes: u64,
-	/// The input a flash is pending for: its number and when it arrived.
-	pending: Option<(u64, u64)>,
+	/// The input a flash is pending for: its number, when it arrived, and its click id.
+	pending: Option<(u64, u64, Option<u64>)>,
 	/// White frames still to present for the current flash, and when its first white frame was drawn.
 	white_left: u32,
 	white_since: Option<Instant>,
@@ -154,12 +177,20 @@ impl App {
 		let t = now_us();
 		self.inputs += 1;
 		let n = self.inputs;
-		self.log_line(format!(r#"{{"event":"input","input":{n},"kind":"{kind}","t_us":{t}}}"#));
+		let size = self.gpu.as_ref().map(|g| g.window().inner_size());
+		let id = (kind == "click")
+			.then(|| click_id(self.pointer?, size.map(|s| (f64::from(s.width), f64::from(s.height)))?))
+			.flatten();
+		let click = id.map(|id| format!(r#","click_id":{id}"#)).unwrap_or_default();
+		self.log_line(format!(
+			r#"{{"event":"input","input":{n},"kind":"{kind}"{click},"t_us":{t},"unix_us":{}}}"#,
+			unix_us(t)
+		));
 		if self.pending.is_some() || self.white_left > 0 || self.white_since.is_some() {
 			self.merged += 1;
 			return;
 		}
-		self.pending = Some((n, t));
+		self.pending = Some((n, t, id));
 		self.white_left = self.options.flash_frames;
 	}
 
@@ -182,12 +213,14 @@ impl App {
 					self.white_since.get_or_insert_with(Instant::now);
 				}
 				// The first white frame of a flash is the one a sensor or a client sees.
-				if let Some((input, input_us)) = self.pending.take() {
+				if let Some((input, input_us, id)) = self.pending.take() {
 					self.flashes += 1;
 					let flash = self.flashes;
 					self.latencies.push((t - input_us) as f64 / 1000.0);
 					self.log_line(format!(
-						r#"{{"event":"flash","flash":{flash},"input":{input},"t_us":{t},"input_to_submit_us":{}}}"#,
+						r#"{{"event":"flash","flash":{flash},"input":{input}{},"t_us":{t},"unix_us":{},"input_to_submit_us":{}}}"#,
+						id.map(|id| format!(r#","click_id":{id}"#)).unwrap_or_default(),
+						unix_us(t),
 						t - input_us
 					));
 				}
@@ -253,6 +286,7 @@ impl ApplicationHandler for App {
 					gpu.resized();
 				}
 			},
+			WindowEvent::CursorMoved { position, .. } => self.pointer = Some((position.x, position.y)),
 			WindowEvent::MouseInput {
 				state: ElementState::Pressed,
 				..
@@ -297,7 +331,8 @@ fn main() -> ExitCode {
 	let log: Option<Box<dyn Write>> = match options.log.as_deref() {
 		None => None,
 		Some("-") => Some(Box::new(std::io::stdout())),
-		Some(path) => match File::create(path) {
+		// Appended to, so a reader following the file keeps its place when the app starts again.
+		Some(path) => match std::fs::OpenOptions::new().create(true).append(true).open(path) {
 			Ok(f) => Some(Box::new(BufWriter::new(f))),
 			Err(e) => {
 				eprintln!("clickflash: {path}: {e}");
@@ -320,6 +355,7 @@ fn main() -> ExitCode {
 		inputs: 0,
 		flashes: 0,
 		pending: None,
+		pointer: None,
 		white_left: 0,
 		white_since: None,
 		merged: 0,
@@ -337,5 +373,21 @@ fn main() -> ExitCode {
 			ExitCode::FAILURE
 		},
 		None => ExitCode::SUCCESS,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn click_ids_come_back_from_the_cell_under_the_pointer() {
+		// Where gamestream-test-client puts the pointer for id 130 (column 2, row 2) on a 1920x1080 stream.
+		let (x, y) = (5.0 * 1920.0 / 128.0, 5.0 * 1080.0 / 64.0);
+		assert_eq!(click_id((x, y), (1920.0, 1080.0)), Some(130));
+		// The same spot on a window scaled to 2560x1440.
+		assert_eq!(click_id((x * 4.0 / 3.0, y * 4.0 / 3.0), (2560.0, 1440.0)), Some(130));
+		assert_eq!(click_id((0.0, 0.0), (1920.0, 1080.0)), Some(0));
+		assert_eq!(click_id((1920.0, 5.0), (1920.0, 1080.0)), None);
 	}
 }
